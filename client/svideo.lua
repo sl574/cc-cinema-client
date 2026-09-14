@@ -4,6 +4,19 @@
 --   svideo <job_id> [fps] [from_sec]
 -- example: svideo 46294e34f1d32d049252 20
 -- pause: tap monitor / space
+--
+-- v8 "анти-пленка": сервер MC шлет снимок монитора клиентам РАЗ В ТИК.
+-- Раньше кадр рисовался 40-70 блитами с Lua-работой между ними, и снимок
+-- регулярно падал посреди отрисовки: верх - новый кадр, низ - старый,
+-- шов гуляет = "пленка". Плюс DFPWM-декод (65К сэмплов) и разбор пачек
+-- держали комп 50-500мс, видеотаймер ждал, потом кадры летели пачкой.
+-- Теперь: вся Lua-работа (RLE, патч дельт) - ДО сна; после пробуждения
+-- таймера (начало тика) - только ПЛОТНАЯ серия блитов изменившихся строк
+-- (~1-2мс) + палитра. Не больше одного кадра на тик. При отставании дельты
+-- ПРИМЕНЯЮТСЯ к базе без показа (а не выбрасываются) - база цельная,
+-- шлейфа нет. Звук декодируется кусками по 512 байт с yield между.
+-- svideo_dbg.lua = ЭТОТ ЖЕ файл (копия): телеметрия в углу включается
+-- по имени программы (*dbg*), отдельную версию не поддерживаем.
 local OWNER = "sl574"
 local REPO = "cc-cinema"
 local AFISHA_URL = "https://raw.githubusercontent.com/" .. OWNER .. "/" .. REPO .. "/main/afisha.json"
@@ -35,11 +48,13 @@ if not token then
     return
 end
 
+local DEBUG = (shell and shell.getRunningProgram() or ""):lower():find("dbg") ~= nil
+
 local monitor = peripheral.find("monitor")
 if not monitor then print("no monitor"); return end
 monitor.setTextScale(0.5)
 local mw, mh = monitor.getSize()
-print("RTV v6 monitor: " .. mw .. "x" .. mh .. " fps: " .. fps)
+print("RTV v8 monitor: " .. mw .. "x" .. mh .. " fps: " .. fps .. (DEBUG and " [dbg]" or ""))
 
 -- стандартные 16 цветов CC: сбрасываем палитру при старте,
 -- иначе оборванный прошлый показ оставляет "невидимые чернила"
@@ -55,19 +70,7 @@ for i = 0, 15 do
 end
 
 local vw, vh = mw, mh
-local limit = 14000
-if fps >= 16 then limit = 12000
-elseif fps >= 11 then limit = 12000 end
-if vw * vh > limit then
-    local k = math.sqrt(limit / (vw * vh))
-    vw = math.max(20, math.floor(vw * k))
-    vh = math.max(20, math.floor(vh * k))
-    print("video window: " .. vw .. "x" .. vh .. " (center, shrunk for fps)")
-else
-    print("video window: " .. vw .. "x" .. vh)
-end
-local ox = math.floor((mw - vw) / 2) + 1
-local oy = math.floor((mh - vh) / 2) + 1
+local ox, oy = 1, 1
 
 local savedPal = {}
 for i = 0, 15 do savedPal[i] = { monitor.getPaletteColour(2 ^ i) } end
@@ -237,6 +240,8 @@ local maxVQueue = math.max(12, math.floor(700000 / cell))
 local total_frames = meta.total_frames
 if #idx0 ~= total_frames + 1 then
     print("idx warn: " .. #idx0 .. " vs frames " .. total_frames)
+    -- по индексу режем записи: без оффсета кадр не достать
+    if #idx0 < total_frames + 1 then total_frames = #idx0 - 1 end
 end
 local duration = meta.duration or 0
 local dchunk = meta.audio_dfpwm_chunk or 8192
@@ -263,7 +268,7 @@ monitor.clear()
 local BATCH_V = 60
 local BATCH_A = 24
 
-local vQueue = {}
+local vQueue = {} -- сырые записи (строки), первый байт = тип K/D/R
 local aQueue = {}
 local fetch_done = false
 local paused = false
@@ -271,116 +276,42 @@ local finished = false -- playVideo выставляет в конце, чтоб
 -- часы A/V-синка (секунды показанного/сыгранного от старта показа):
 -- видео убегает вперед скипами, звук догоняет сбросами (см. playAudio)
 local vTime, avWaited, aTime, droppedA = 0, 0, 0, 0
-local lastFrame = nil
--- статистика потока: K/R/D принято, drop битых, trunc обрезанных батчей,
--- gap разрывов непрерывности, dup дублей
-local cntBlitErr = 0
+-- статистика: dropped - кадры, примененные к базе без показа (отставание),
+-- late - пробуждений с отставанием >1 кадра, stalls - тиков без данных
+-- (сеть/CDN), badRec - битые записи
+local dropped, late, stalls, badRec = 0, 0, 0, 0
 
-local function rleDecode(rle)
-    local parts = {}
-    local p = 1
-    -- висячий нечетный хвост игнорируем, а не падаем (иначе смерть видеопотока)
-    while p + 1 <= #rle do
-        local v = rle:byte(p)
-        local c = rle:byte(p + 1)
-        p = p + 2
-        parts[#parts + 1] = string.rep(string.char(v), c)
-    end
-    return table.concat(parts)
+local sbyte, schar, srep, ssub = string.byte, string.char, string.rep, string.sub
+local unpack = table.unpack or unpack
+local floor = math.floor
+-- table.move есть не во всех версиях Cobalt: ручной фолбэк
+local tmove = table.move or function(a, f, e, t, b)
+    for i = f, e do b[t + i - f] = a[i] end
+    return b
 end
 
--- запись: 'K' [u16][t][u16][f][u16][g][48pal]
---         'D' [u16 n]([u16 idx][ch][fg][bg])*
---         'R' [u16 nrect]([u8 x,y,w,h][ch][fg][bg])* + [48pal]
--- Обрезанный хвост не съедаем: фетчер дозапросит остаток.
--- Возвращает got (принято записей).
-local function parseSBatch(data, out)
-    local p, got = 1, 0
-    while p <= #data do
-        local rs = p -- начало записи (точка отката при обрезе)
-        local typ = data:sub(p, p)
-        p = p + 1
-        if typ == "K" then
-            local lens, ok = {}, true
-            for k = 1, 3 do
-                if p + 1 > #data then ok = false break end
-                local ln = data:byte(p) * 256 + data:byte(p + 1)
-                if ln > cell * 2 + 64 then ok = false break end -- мусор, не запись
-                if p + 2 + ln - 1 > #data then ok = false break end
-                lens[k] = ln
-                p = p + 2 + ln
-            end
-            if ok then
-                if p + 47 > #data then ok = false else p = p + 48 end
-            end
-            if not ok then p = rs break end
-            local q, vals = rs + 1, {}
-            for k = 1, 3 do
-                local ln = data:byte(q) * 256 + data:byte(q + 1) q = q + 2
-                vals[k] = rleDecode(data:sub(q, q + ln - 1)) q = q + ln
-            end
-            local pal = data:sub(q, q + 47)
-            if #vals[1] == cell and #vals[2] == cell and #vals[3] == cell then
-                out[#out + 1] = { full = true, t = vals[1], f = vals[2], g = vals[3], pal = pal }
-                got = got + 1
-            end
-        elseif typ == "D" then
-            if p + 1 > #data then p = rs break end
-            local n = data:byte(p) * 256 + data:byte(p + 1)
-            if n > cell then p = rs break end -- мусор, не запись
-            if p + 2 + n * 5 - 1 > #data then p = rs break end
-            -- группируем по строкам: одна склейка на строку вместо одной на клетку
-            local byrow, q, ok = {}, p + 2, true
-            for _ = 1, n do
-                local idx = data:byte(q) * 256 + data:byte(q + 1)
-                if idx >= cell then ok = false break end
-                local ch, f, g = data:byte(q + 2), data:byte(q + 3), data:byte(q + 4)
-                local row = math.floor(idx / vw)
-                local r = byrow[row]
-                if not r then r = {} byrow[row] = r end
-                r[#r + 1] = { col = idx % vw, n = 1, ch = ch, f = f, g = g }
-                q = q + 5
-            end
-            p = p + 2 + n * 5
-            if ok then
-                out[#out + 1] = { full = false, byrow = byrow }
-                got = got + 1
-            end
-        elseif typ == "R" then
-            if p + 1 > #data then p = rs break end
-            local nrect = data:byte(p) * 256 + data:byte(p + 1)
-            if nrect > cell then p = rs break end -- мусор, не запись
-            if p + 2 + nrect * 7 + 48 - 1 > #data then p = rs break end
-            local byrow, q, ok = {}, p + 2, true
-            for _ = 1, nrect do
-                local x, y, w, h = data:byte(q, q + 3)
-                if x + w > vw or y + h > vh or w < 1 or h < 1 then ok = false break end
-                local ch, f, g = data:byte(q + 4), data:byte(q + 5), data:byte(q + 6)
-                q = q + 7
-                -- n растягиваем сразу в спан: одна склейка на строку
-                for yy = y, y + h - 1 do
-                    local r = byrow[yy]
-                    if not r then r = {} byrow[yy] = r end
-                    r[#r + 1] = { col = x, n = w, ch = ch, f = f, g = g }
-                end
-            end
-            local pal = data:sub(q, q + 47)
-            if ok and #pal == 48 then
-                p = q + 48
-                out[#out + 1] = { full = "rect", pal = pal, byrow = byrow }
-                got = got + 1
-            else
-                -- битый R целиком пропускаем по вычисленной границе (не рвем поток)
-                p = rs + 1 + 2 + nrect * 7 + 48
-            end
-        else
-            break -- неизвестный тип: байт не едим, остаток дозапросится
-        end
+-- yield БЕЗ ожидания тика: отдаем очередь событий другим потокам (прежде
+-- всего видеотаймеру) посреди тяжелой работы и сразу продолжаем
+local function yieldNow()
+    os.queueEvent("rtv:y")
+    os.pullEvent("rtv:y")
+end
+
+-- Пачка с CDN режется на записи ПО ИНДЕКСУ (idx0), а не разбором длин:
+-- дешево, и счет кадров всегда совпадает с индексом даже при битой записи
+-- (битую отбросит декодер). Обрезанный хвост не съедаем: дозапросится.
+local function sliceBatch(data, vn, c, first, out)
+    local got = 0
+    for i = 0, c - 1 do
+        local a = idx0[vn + i + 1] - first + 1
+        local b = idx0[vn + i + 2] - first
+        if b > #data then break end
+        out[#out + 1] = ssub(data, a, b)
+        got = got + 1
     end
     return got
 end
 
--- плашка "нет сети" поверх застывшего кадра + полная перерисовка базы при оживлении
 local function fetcher()
     local vn, an = startFrame, startChunk
     local vFails, aFails = 0, 0
@@ -405,7 +336,7 @@ local function fetcher()
                 local first, last = idx0[vn + 1], idx0[vn + c + 1] - 1
                 local data = httpRangeRetry(assetUrl(files["sixel.rle"]), first, last, 3)
                 if data then
-                    local got = parseSBatch(data, vQueue)
+                    local got = sliceBatch(data, vn, c, first, vQueue)
                     if got > 0 then vn = vn + got vFails = 0
                     else vFails = vFails + 1 sleep(0.5) end
                 else
@@ -425,7 +356,7 @@ local function fetcher()
                         local p = 1
                         local got = 0
                         while p <= #data do
-                            aQueue[#aQueue + 1] = data:sub(p, p + dchunk - 1)
+                            aQueue[#aQueue + 1] = ssub(data, p, p + dchunk - 1)
                             p = p + dchunk
                             got = got + 1
                         end
@@ -445,6 +376,21 @@ local function fetcher()
 end
 
 local decoder = dfpwm and dfpwm.make_decoder() or nil
+-- DFPWM-декод чанка (8КБ = 65К сэмплов) - чистый Lua, 50-150мс одним куском:
+-- пока он шел, таймер видео лежал в очереди и кадр уезжал в следующий тик.
+-- Режем на куски по 512 байт (~4К сэмплов, единицы мс) с yield между.
+local function decodeChunk(data)
+    local out, n = {}, 0
+    local step = 512
+    for i = 1, #data, step do
+        local part = decoder(ssub(data, i, i + step - 1))
+        local pn = #part
+        tmove(part, 1, pn, n + 1, out)
+        n = n + pn
+        if i + step <= #data then yieldNow() end
+    end
+    return out
+end
 local function playOn(sp, pcm)
     -- ждем ЛЮБОЕ событие (не только speaker_audio_empty):
     -- иначе пауза внутри ожидания = вечный сон и немой звук.
@@ -470,13 +416,13 @@ local function playAudio()
                 droppedA = droppedA + 1
             else
                 table.remove(aQueue, 1)
-                local pcm = decoder(data)
-            -- один чанк сразу во все колонки, параллельно (как у YouCube)
-            local fns = {}
-            for i, sp in ipairs(speakers) do
-                fns[i] = function() playOn(sp, pcm) end
-            end
-            parallel.waitForAll(table.unpack(fns))
+                local pcm = decodeChunk(data)
+                -- один чанк сразу во все колонки, параллельно (как у YouCube)
+                local fns = {}
+                for i, sp in ipairs(speakers) do
+                    fns[i] = function() playOn(sp, pcm) end
+                end
+                parallel.waitForAll(table.unpack(fns))
                 aTime = aTime + dur
             end
         elseif fetch_done then
@@ -487,8 +433,133 @@ local function playAudio()
     end
 end
 
--- базовый кадр для дельт
-local base = nil
+-- База (текущий кадр) ПОСТРОЧНО: bt/bf/bg[r] = строки длиной vw, r=0..vh-1.
+-- st/sf/sg = что реально стоит на мониторе (nil = неизвестно -> перерисовать).
+-- Инвариант: монитор == st/sf/sg всегда, кроме окна между применением кадра
+-- к базе и серией блитов на следующем тике.
+local bt, bf, bg = {}, {}, {}
+local st, sf, sg = {}, {}, {}
+local haveBase = false
+local pendingPal = nil -- палитра последнего K/R, ставится в серии блитов
+local BLANK_T, BLANK_F, BLANK_G = srep(" ", vw), srep("0", vw), srep("f", vw)
+
+local function rleDecode(s, i, j)
+    local parts, n = {}, 0
+    -- висячий нечетный хвост игнорируем, а не падаем (иначе смерть видеопотока)
+    while i + 1 <= j do
+        local v, c = sbyte(s, i, i + 1)
+        n = n + 1
+        parts[n] = (c == 1) and schar(v) or srep(schar(v), c)
+        i = i + 2
+    end
+    return table.concat(parts)
+end
+
+-- запись: 'K' [u16][t][u16][f][u16][g][48pal]
+--         'D' [u16 n]([u16 idx][ch][fg][bg])*
+--         'R' [u16 nrect]([u8 x,y,w,h][ch][fg][bg])* + [48pal]
+-- Все u16 big-endian (struct ">H" на сервере).
+local function applyK(raw)
+    local q, planes = 2, {}
+    for k = 1, 3 do
+        if #raw < q + 1 then return false end
+        local ln = sbyte(raw, q) * 256 + sbyte(raw, q + 1)
+        q = q + 2
+        if #raw < q + ln - 1 then return false end
+        local s = rleDecode(raw, q, q + ln - 1)
+        if #s ~= cell then return false end
+        planes[k] = s
+        q = q + ln
+    end
+    if #raw < q + 47 then return false end
+    local t, f, g = planes[1], planes[2], planes[3]
+    for r = 0, vh - 1 do
+        local a = r * vw
+        bt[r] = ssub(t, a + 1, a + vw)
+        bf[r] = ssub(f, a + 1, a + vw)
+        bg[r] = ssub(g, a + 1, a + vw)
+    end
+    pendingPal = ssub(raw, q, q + 47)
+    haveBase = true
+    return true
+end
+
+-- точечные правки строк через байтовые таблицы, потом обратно в строки
+local function rowTables(r, T, F, G)
+    local t = T[r]
+    if not t then
+        t = { sbyte(bt[r], 1, -1) }
+        T[r] = t
+        F[r] = { sbyte(bf[r], 1, -1) }
+        G[r] = { sbyte(bg[r], 1, -1) }
+    end
+    return t, F[r], G[r]
+end
+local function commitRows(T, F, G)
+    for r, t in pairs(T) do
+        bt[r] = schar(unpack(t))
+        bf[r] = schar(unpack(F[r]))
+        bg[r] = schar(unpack(G[r]))
+    end
+end
+
+local function applyD(raw)
+    if not haveBase then return true end -- дельта без базы: молча ждем K
+    if #raw < 3 then return false end
+    local n = sbyte(raw, 2) * 256 + sbyte(raw, 3)
+    if #raw < 3 + n * 5 then return false end
+    local T, F, G = {}, {}, {}
+    local q = 4
+    for _ = 1, n do
+        local idx = sbyte(raw, q) * 256 + sbyte(raw, q + 1)
+        if idx < cell then
+            local r = floor(idx / vw)
+            local c = idx - r * vw + 1
+            local t, f, g = rowTables(r, T, F, G)
+            t[c], f[c], g[c] = sbyte(raw, q + 2, q + 4)
+        end
+        q = q + 5
+    end
+    commitRows(T, F, G)
+    return true
+end
+
+local function applyR(raw)
+    if #raw < 3 then return false end
+    local n = sbyte(raw, 2) * 256 + sbyte(raw, 3)
+    if #raw < 3 + n * 7 + 48 then return false end
+    -- R = полный кадр: база с чистого ЧЕРНОГО (как monitor.clear) + прямоугольники
+    for r = 0, vh - 1 do bt[r], bf[r], bg[r] = BLANK_T, BLANK_F, BLANK_G end
+    local T, F, G = {}, {}, {}
+    local q = 4
+    for _ = 1, n do
+        local x, y, w, h, ch, fc, gc = sbyte(raw, q, q + 6)
+        q = q + 7
+        if w >= 1 and h >= 1 and x + w <= vw and y + h <= vh then
+            for r = y, y + h - 1 do
+                local t, f, g = rowTables(r, T, F, G)
+                for c = x + 1, x + w do t[c], f[c], g[c] = ch, fc, gc end
+            end
+        end
+    end
+    commitRows(T, F, G)
+    pendingPal = ssub(raw, q, q + 47)
+    haveBase = true
+    return true
+end
+
+local lastKind = "?"
+local function applyRecord(raw)
+    local typ = sbyte(raw, 1)
+    local ok
+    if typ == 75 then ok = applyK(raw) lastKind = "K"
+    elseif typ == 68 then ok = applyD(raw) lastKind = "D"
+    elseif typ == 82 then ok = applyR(raw) lastKind = "R"
+    else ok = false lastKind = "?" end
+    if not ok then badRec = badRec + 1 end
+    return ok
+end
+
 local curPal = nil
 local darkIdx = 15
 local function paintMargins()
@@ -497,7 +568,7 @@ local function paintMargins()
     local function bar(x, y, w)
         if w <= 0 then return end
         monitor.setCursorPos(x, y)
-        monitor.blit(string.rep(" ", w), string.rep("0", w), string.rep(dig, w))
+        monitor.blit(srep(" ", w), srep("0", w), srep(dig, w))
     end
     for y = 1, oy - 1 do bar(1, y, mw) end
     for y = oy + vh, mh do bar(1, y, mw) end
@@ -509,14 +580,14 @@ end
 local function applyPalette(pal)
     -- ставим только изменившиеся слоты: меньше всполохов и быстрее
     for i = 0, 15 do
-        if not curPal or pal:sub(i * 3 + 1, i * 3 + 3) ~= curPal:sub(i * 3 + 1, i * 3 + 3) then
-            local r, g, b = pal:byte(i * 3 + 1, i * 3 + 3)
+        if not curPal or ssub(pal, i * 3 + 1, i * 3 + 3) ~= ssub(curPal, i * 3 + 1, i * 3 + 3) then
+            local r, g, b = sbyte(pal, i * 3 + 1, i * 3 + 3)
             monitor.setPaletteColour(2 ^ i, r / 255, g / 255, b / 255)
         end
     end
     local best, bestV = 15, 10 ^ 9
     for i = 0, 15 do
-        local r, g, b = pal:byte(i * 3 + 1, i * 3 + 3)
+        local r, g, b = sbyte(pal, i * 3 + 1, i * 3 + 3)
         local v = r + g + b
         if v < bestV then best, bestV = i, v end
     end
@@ -527,102 +598,36 @@ local function applyPalette(pal)
     curPal = pal
 end
 
--- безопасный блит: кривые длины пропускаем со счетчиком, а не роняем видеопоток
-local function safeBlit(x, y, ts, fs, gs)
-    if #ts == vw and #fs == vw and #gs == vw then
-        monitor.setCursorPos(x, y)
-        monitor.blit(ts, fs, gs)
-    else
-        cntBlitErr = cntBlitErr + 1
-    end
-end
-
-local function blitRow(y, t, f, g)
-    safeBlit(ox, oy + y,
-             t:sub(y * vw + 1, (y + 1) * vw),
-             f:sub(y * vw + 1, (y + 1) * vw),
-             g:sub(y * vw + 1, (y + 1) * vw))
-end
-
--- вшивание спанов byrow[row] = {{col, n, ch, f, g}} в строки bs (без отрисовки).
--- Возвращает список {row, t, f, g} затронутых строк.
-local function patchRows(bs, byrow)
-    local dirty = {}
-    for row, list in pairs(byrow) do
-        if row >= 0 and row < vh then
-            local a, b = row * vw + 1, (row + 1) * vw
-            local t = { bs.t:sub(a, b):byte(1, -1) }
-            local f = { bs.f:sub(a, b):byte(1, -1) }
-            local g = { bs.g:sub(a, b):byte(1, -1) }
-            for _, c in ipairs(list) do
-                local n = c.n or 1
-                for k = 0, n - 1 do
-                    local kk = c.col + 1 + k
-                    if kk <= vw then t[kk], f[kk], g[kk] = c.ch, c.f, c.g end
-                end
-            end
-            local ts, fs, gs = string.char(table.unpack(t)),
-                               string.char(table.unpack(f)),
-                               string.char(table.unpack(g))
-            bs.t = bs.t:sub(1, a - 1) .. ts .. bs.t:sub(b + 1)
-            bs.f = bs.f:sub(1, a - 1) .. fs .. bs.f:sub(b + 1)
-            bs.g = bs.g:sub(1, a - 1) .. gs .. bs.g:sub(b + 1)
-            dirty[#dirty + 1] = { row = row, t = ts, f = fs, g = gs }
+-- строки, отличающиеся от монитора (считаем ДО сна, не в серии блитов)
+local function diffRows()
+    local list, n = {}, 0
+    for r = 0, vh - 1 do
+        if bt[r] ~= st[r] or bf[r] ~= sf[r] or bg[r] ~= sg[r] then
+            n = n + 1
+            list[n] = r
         end
     end
-    return dirty
+    return list
 end
 
-
-local function drawFrame(fr)
-    if fr.full == true then
-        local old = base
-        base = { t = fr.t, f = fr.f, g = fr.g }
-        if not old then
-            for y = 0, vh - 1 do blitRow(y, fr.t, fr.f, fr.g) end
-        else
-            -- v7.1: полный кадр рисуем только изменившимися строками.
-            -- Было 49 блитов вслепую: на стене 8x5 sweep было видно как
-            -- "плывущую пленку". Семантика та же (база+палитра обновлены).
-            for y = 0, vh - 1 do
-                local a, b = y * vw + 1, (y + 1) * vw
-                if fr.t:sub(a, b) ~= old.t:sub(a, b)
-                or fr.f:sub(a, b) ~= old.f:sub(a, b)
-                or fr.g:sub(a, b) ~= old.g:sub(a, b) then
-                    blitRow(y, fr.t, fr.f, fr.g)
-                end
-            end
-        end
-        -- палитру ставим ПОСЛЕ строк (как YouCube): перекрас всего экрана
-        -- атомарный, без цветовой вспышки перед sweep перерисовки
-        applyPalette(fr.pal)
-    elseif fr.full == "rect" then
-        -- R is a full frame: reset base to BLACK and fill rectangles
-        -- (фон "f"=black как monitor.clear; было "0"=white и ореолы на-unsync)
-        local old = base
-        base = { t = string.rep(" ", cell), f = string.rep("0", cell), g = string.rep("f", cell) }
-        patchRows(base, fr.byrow)
-        if not old then
-            for y = 0, vh - 1 do blitRow(y, base.t, base.f, base.g) end
-        else
-            for y = 0, vh - 1 do
-                local a, b = y * vw + 1, (y + 1) * vw
-                local t, f, g = base.t:sub(a, b), base.f:sub(a, b), base.g:sub(a, b)
-                if t ~= old.t:sub(a, b) or f ~= old.f:sub(a, b) or g ~= old.g:sub(a, b) then
-                    safeBlit(ox, oy + y, t, f, g)
-                end
-            end
-        end
-        applyPalette(fr.pal)
-    else
-        if not base then return end -- delta without base, wait for keyframe
-        local dirty = patchRows(base, fr.byrow)
-        for _, d in ipairs(dirty) do
-            monitor.setCursorPos(ox, oy + d.row)
-            monitor.blit(d.t, d.f, d.g)
-        end
+-- ПЛОТНАЯ серия блитов: между вызовами никакой Lua-работы, чтобы уложиться
+-- до снимка монитора в этом же тике. Палитра ПОСЛЕ строк (как YouCube):
+-- в одном тике это атомарно, вспышки нет.
+local mSetCursor, mBlit = monitor.setCursorPos, monitor.blit
+local function blitRows(list)
+    for i = 1, #list do
+        local r = list[i]
+        mSetCursor(ox, oy + r)
+        mBlit(bt[r], bf[r], bg[r])
     end
-    lastFrame = fr
+    for i = 1, #list do
+        local r = list[i]
+        st[r], sf[r], sg[r] = bt[r], bf[r], bg[r]
+    end
+    if pendingPal then
+        applyPalette(pendingPal)
+        pendingPal = nil
+    end
 end
 
 local function drawPauseOverlay()
@@ -635,16 +640,12 @@ local function drawPauseOverlay()
     monitor.write(msg)
 end
 
--- после resume стираем плашку полным репейнтом базы, иначе текст
--- "PAUZA" остается висеть до следующего полного кадра
+-- после resume стираем плашку полным репейнтом базы (сброс st/sf/sg),
+-- иначе текст "PAUZA" остается висеть до следующего полного кадра
 local needRedraw = false
 -- дебаунс тоггла паузы (мс): давит дребезг тапов мультиблочного монитора,
 -- даблтапы по лагу и автоповторы зажатой клавиши
 local lastToggle = 0
-local function repaintBase()
-    if not base then return end
-    for y = 0, vh - 1 do blitRow(y, base.t, base.f, base.g) end
-end
 
 local function watchPause()
     while not finished do
@@ -675,57 +676,117 @@ local function watchPause()
     end
 end
 
-local dropped = 0
-local resyncs = 0 -- сколько раз скип уперся в полный кадр (ресинк цепочки D)
+-- телеметрия ВНЕ видеоокна (строки 1-2 монитора; на фулскрине - поверх
+-- видео, эти строки потом перерисуются): F<кадр> <K/R/D> d<dropped>
+-- l<late> s<stalls> q<очередь> + геометрия
+local function dbgTag(n)
+    monitor.setCursorPos(1, 1)
+    monitor.setTextColour(colours.lime)
+    monitor.setBackgroundColour(colours.black)
+    monitor.write(string.format("F%d %s d%d l%d s%d q%d",
+        n, lastKind, dropped, late, stalls, #vQueue))
+    monitor.setCursorPos(1, 2)
+    monitor.write(string.format("mon%dx%d win%dx%d@%d,%d",
+        mw, mh, vw, vh, ox, oy))
+    -- строки под тегом больше не равны базе: перерисовать в следующей серии
+    for y = 1, 2 do
+        local r = y - oy
+        if r >= 0 and r < vh then st[r] = nil end
+    end
+end
+
+-- Кадр в тик. Цикл: [пробуждение таймера = начало тика] -> серия блитов
+-- подготовленного кадра -> применить к базе следующий(е) кадр(ы) ->
+-- посчитать изменившиеся строки -> спать до момента показа. Отставание
+-- гасится применением нескольких кадров к базе за тик (показан только
+-- последний), если среди них есть K/R - все до него просто выбрасываем.
+local MAX_APPLY = 8 -- кадров к базе за тик максимум (иначе сами же опоздаем)
 local function playVideo()
-    local interval = 1 / fps
-    local t0 = os.epoch("utc")
-    local n = startFrame
-    local m = 0
+    local interval = 1000 / fps
+    local n = startFrame   -- следующий кадр из очереди (номер в фильме)
+    local m = 0            -- кадров пройдено от старта (показано + dropped)
+    -- t0 = момент показа кадра 0 = следующий тик
+    local t0 = os.epoch("utc") + 50
+    local pendingRows = nil
     while true do
-        if needRedraw and base and not paused then
-            needRedraw = false
-            repaintBase()
-        end
         if paused then
-            sleep(0.05)
-            t0 = t0 + 50
-        elseif #vQueue > 0 and not (#speakers > 0 and aTime < vTime - 1.0 and avWaited < 3000) then
-            local now = os.epoch("utc")
-            local expected = (now - t0) / 1000 * fps
-            if expected - m > fps * 0.75 and #vQueue > 2 then
-                -- v7.1 цепные дельты: скипаем все D до ближайшего полного кадра,
-                -- полный всегда рисуем (там же ресинк базы). Пропуск D без
-                -- ресинка давал бы шлейф до конца GOP.
-                local skip = math.min(#vQueue - 1, math.floor(expected - m) - 1)
-                while skip > 0 and #vQueue > 1 do
-                    if vQueue[1].full then resyncs = resyncs + 1 break end
-                    table.remove(vQueue, 1) n = n + 1 m = m + 1 dropped = dropped + 1
-                    skip = skip - 1
+            local pt = os.epoch("utc")
+            sleep(0.1)
+            t0 = t0 + (os.epoch("utc") - pt) -- часы стоят вместе с картинкой
+        else
+            -- 1) сразу после пробуждения: серия блитов, ничего лишнего
+            if needRedraw then
+                needRedraw = false
+                st, sf, sg = {}, {}, {}
+                pendingRows = nil
+            end
+            local list = pendingRows or diffRows()
+            pendingRows = nil
+            if #list > 0 or pendingPal then blitRows(list) end
+            if DEBUG and m > 0 then
+                dbgTag(startFrame + m - 1)
+                if m % 100 == 0 then
+                    print("f" .. (startFrame + m - 1) .. " " .. lastKind .. " vq" .. #vQueue ..
+                          " aq" .. #aQueue .. " drop" .. dropped .. " late" .. late ..
+                          " stall" .. stalls .. " bad" .. badRec .. " done" .. tostring(fetch_done))
                 end
             end
-            local fr = table.remove(vQueue, 1)
-            drawFrame(fr)
-            -- скип мог выкинуть кейфрейм: если дельта пришла без базы, ждем следующий K
-            n = n + 1
-            m = m + 1
-            vTime = m / fps
-            if aTime >= vTime - 0.5 then avWaited = 0 end
-            if n >= total_frames and fetch_done then break end
-            local target = t0 + m * interval * 1000
-            local now2 = os.epoch("utc")
-            if target > now2 then sleep((target - now2) / 1000) end
-        elseif #vQueue > 0 then
-            -- av-wait: звук отстал больше секунды (пролаг) - стоим на месте,
-            -- двигаем часы как на паузе. Иначе скип убежит вперед, а звук
-            -- догонять не умеет и отстанет навсегда.
-            sleep(0.1)
-            t0 = t0 + 100
-            avWaited = avWaited + 100
-        elseif fetch_done then
-            break
-        else
-            sleep(0.02)
+            -- 2) конец фильма / фетчер сдался
+            if n >= total_frames or (#vQueue == 0 and fetch_done) then break end
+            local now = os.epoch("utc")
+            local avHold = total_dchunks > 0 and aTime < vTime - 1.0 and avWaited < 3000
+            if #vQueue == 0 or avHold then
+                -- 3a) нет данных (сеть) или звук отстал >1с (пролаг): стоим.
+                -- Часы держим, если звука нет (нечего догонять - покажем все
+                -- кадры) или ждем звук. Со звуком часы идут: звук буферизован
+                -- глубже видео и играет дальше, видео потом догонит скипом.
+                if #vQueue == 0 then stalls = stalls + 1 end
+                sleep(0.05)
+                local dt = os.epoch("utc") - now
+                if avHold then
+                    t0 = t0 + dt
+                    avWaited = avWaited + dt
+                elseif total_dchunks == 0 then
+                    t0 = t0 + dt
+                end
+            else
+                -- 3b) сколько кадров должно быть показано к СЛЕДУЮЩЕМУ тику
+                local want = floor((now + 50 - t0) / interval) + 1
+                if want < m + 1 then want = m + 1 end
+                local deficit = math.min(want - m, #vQueue)
+                if deficit > 1 then
+                    late = late + 1
+                    -- отстаем: все до ПОСЛЕДНЕГО полного кадра в пределах
+                    -- отставания выбрасываем не применяя (K/R сбросят базу)
+                    local lastFull = nil
+                    for i = 1, deficit do
+                        if sbyte(vQueue[i], 1) ~= 68 then lastFull = i end
+                    end
+                    if lastFull and lastFull > 1 then
+                        for _ = 1, lastFull - 1 do
+                            table.remove(vQueue, 1)
+                            n, m, dropped = n + 1, m + 1, dropped + 1
+                        end
+                        deficit = deficit - (lastFull - 1)
+                    end
+                end
+                -- остальные применяем к базе цепочкой (не больше MAX_APPLY
+                -- за тик); показан будет только последний
+                local budget = math.min(deficit, MAX_APPLY)
+                for i = 1, budget do
+                    applyRecord(table.remove(vQueue, 1))
+                    n, m = n + 1, m + 1
+                    if i < budget then dropped = dropped + 1 end
+                end
+                vTime = m / fps
+                if aTime >= vTime - 0.5 then avWaited = 0 end
+                pendingRows = diffRows()
+                -- 4) спим до момента показа кадра (m-1), минимум до след. тика
+                local target = t0 + (m - 1) * interval
+                local wait = target - os.epoch("utc")
+                if wait < 25 then wait = 25 end
+                sleep(wait / 1000)
+            end
         end
     end
     finished = true
@@ -749,9 +810,6 @@ if duration > 0 then
 end
 print("pause: tap monitor / space")
 
--- враппер потоков: любая ошибка печатается СРАЗУ с именем потока
--- (раньше тихая смерть видеопотока выглядела как "стоп-кадр + звук идет"),
--- Terminated (Ctrl+T) пробрасываем дальше чтобы не стать неубиваемым
 if #speakers > 0 then
     parallel.waitForAll(fetcher, playVideoBuffered, playAudioBuffered, watchPause)
 else
@@ -760,7 +818,8 @@ end
 
 restorePalette()
 monitor.setCursorPos(1, mh)
-print("done. dropped(skipped late): " .. dropped .. " resyncs: " .. resyncs .. " blitErr: " .. cntBlitErr .. " audioDrop: " .. droppedA .. " - Ctrl+T for new link")
+print("done. dropped(applied unseen): " .. dropped .. " late: " .. late .. " stalls: " .. stalls ..
+      " badRec: " .. badRec .. " audioDrop: " .. droppedA .. " - Ctrl+T for new link")
 -- цепочка частей (полный метр в нескольких релизах): афиша говорит next -
 -- сами подхватываем следующую часть как "одно видео" (пауза на докачку).
 if meta.next and meta.next ~= job then
