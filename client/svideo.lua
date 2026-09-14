@@ -36,7 +36,7 @@ local fromSec = tonumber(args[3]) or 0
 if fromSec < 0 then fromSec = 0 end
 -- fps для расчета окна: файлы уже сняты на своей частоте, meta позже уточнит
 local fps = 20
-if fpsArg then fps = math.max(1, math.min(20, fpsArg)) end
+if fpsArg then fps = math.max(1, math.min(30, fpsArg)) end
 
 local token = settings.get("svideo.token")
 if not jobid then
@@ -275,7 +275,7 @@ local paused = false
 local finished = false -- playVideo выставляет в конце, чтобы умер watchPause
 -- часы A/V-синка (секунды показанного/сыгранного от старта показа):
 -- видео убегает вперед скипами, звук догоняет сбросами (см. playAudio)
-local vTime, avWaited, aTime, droppedA = 0, 0, 0, 0
+local vTime, avWaited, aTime, droppedA, ceilWaited, audioHold = 0, 0, 0, 0, 0, 0
 -- статистика: dropped - кадры, примененные к базе без показа (отставание),
 -- late - пробуждений с отставанием >1 кадра, stalls - тиков без данных
 -- (сеть/CDN), badRec - битые записи
@@ -404,7 +404,7 @@ local function playAudio()
     while true do
         if paused then
             sleep(0.05)
-        elseif #aQueue > 0 then
+        elseif #aQueue > 0 and not (aTime > vTime + 0.5 and ceilWaited < 10000) then
             local data = aQueue[1]
             local dur = (#data * 8) / 48000 -- чанк звука в секундах
             if aTime < vTime - 0.75 and #aQueue > 1 then
@@ -424,7 +424,15 @@ local function playAudio()
                 end
                 parallel.waitForAll(table.unpack(fns))
                 aTime = aTime + dur
+                ceilWaited = 0
             end
+        elseif #aQueue > 0 then
+            -- потолок: звук убежал вперед видео (видос встал/скипнулся) -
+            -- стоим, колонки доигрывают буфер и молчат. Без потолка звук
+            -- уходит вперед навсегда. Кеп 10с против вечной тишины.
+            sleep(0.1)
+            ceilWaited = ceilWaited + 100
+            audioHold = audioHold + 1
         elseif fetch_done then
             break
         else
@@ -819,7 +827,7 @@ end
 restorePalette()
 monitor.setCursorPos(1, mh)
 print("done. dropped(applied unseen): " .. dropped .. " late: " .. late .. " stalls: " .. stalls ..
-      " badRec: " .. badRec .. " audioDrop: " .. droppedA .. " - Ctrl+T for new link")
+      " badRec: " .. badRec .. " audioDrop: " .. droppedA .. " audioHold: " .. audioHold .. " - Ctrl+T for new link")
 -- цепочка частей (полный метр в нескольких релизах): афиша говорит next -
 -- сами подхватываем следующую часть как "одно видео" (пауза на докачку).
 if meta.next and meta.next ~= job then
