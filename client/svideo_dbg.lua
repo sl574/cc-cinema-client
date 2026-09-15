@@ -400,8 +400,8 @@ local function feedPiece(sp, piece, tp)
     if sp.playAudio(piece) then return true end
     -- буфер полон: ждем ИМЕННО опустошения. Чужие события (таймеры видео
     -- каждые 50мс!) игнорируем, иначе накормим по первому чиху и буфер
-    -- снова встанет полный на 2.7с. Страховка - свой таймер 2с.
-    local t = os.startTimer(2)
+    -- снова встанет полный на 2.7с. Страховка - свой таймер 0.25с.
+    local t = os.startTimer(0.25)
     while true do
         local ev, p1 = os.pullEvent()
         if ev == "speaker_audio_empty" then
@@ -789,7 +789,7 @@ local function playVideo()
             -- 2) конец фильма / фетчер сдался
             if n >= total_frames or (#vQueue == 0 and fetch_done) then break end
             local now = os.epoch("utc")
-            local avHold = total_dchunks > 0 and aTime < vTime - 1.0 and avWaited < 3000
+            local avHold = total_dchunks > 0 and aTime < vTime - 1.25 and avWaited < 2000
             if #vQueue == 0 or avHold then
                 -- 3a) нет данных (сеть) или звук отстал >1с (пролаг): стоим.
                 -- Часы держим, если звука нет (нечего догонять - покажем все
