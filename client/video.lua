@@ -361,14 +361,6 @@ local function fetcher()
 end
 
 local decoder = dfpwm and dfpwm.make_decoder() or nil
-local function playOn(sp, pcm)
-    -- ждем ЛЮБОЕ событие (не только speaker_audio_empty):
-    -- иначе пауза внутри ожидания = вечный сон и немой звук.
-    -- rtv:resume от watchPause гарантированно будит даже в тишине.
-    while not sp.playAudio(pcm) do
-        os.pullEvent()
-    end
-end
 -- отдать кусок PCM (~0.17с) в колонку, дождавшись почти пустого буфера
 -- (speaker_audio_empty), а не любого места: иначе буфер стоит полный
 -- (2.7с) и слышимый сдвиг гуляет независимо от наших часов.
