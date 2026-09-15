@@ -370,8 +370,8 @@ local function feedPiece(sp, piece, tp)
     if sp.playAudio(piece) then return true end
     -- буфер полон: ждем ИМЕННО опустошения. Чужие события (таймеры видео
     -- каждые 50мс!) игнорируем, иначе накормим по первому чиху и буфер
-    -- снова встанет полный на 2.7с. Страховка - свой таймер 2с.
-    local t = os.startTimer(2)
+    -- снова встанет полный на 2.7с. Страховка - свой таймер 0.25с.
+    local t = os.startTimer(0.25)
     while true do
         local ev, p1 = os.pullEvent()
         if ev == "speaker_audio_empty" then
@@ -658,7 +658,7 @@ local function playVideo()
         if paused then
             sleep(0.05)
             t0 = t0 + 50
-        elseif #vQueue > 0 and not (#speakers > 0 and aTime < vTime - 1.0 and avWaited < 3000) then
+        elseif #vQueue > 0 and not (#speakers > 0 and aTime < vTime - 1.25 and avWaited < 2000) then
             local now = os.epoch("utc")
             local expected = (now - t0) / 1000 * fps
             if expected - m > fps * 0.75 and #vQueue > 2 then
