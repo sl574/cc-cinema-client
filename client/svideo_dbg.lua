@@ -782,7 +782,8 @@ local function playVideo()
                 if m % 100 == 0 then
                     print("f" .. (startFrame + m - 1) .. " " .. lastKind .. " vq" .. #vQueue ..
                           " aq" .. #aQueue .. " drop" .. dropped .. " late" .. late ..
-                          " stall" .. stalls .. " bad" .. badRec .. " done" .. tostring(fetch_done))
+                          " stall" .. stalls .. " bad" .. badRec .. " ad" .. droppedA ..
+                          " ah" .. audioHold .. " done" .. tostring(fetch_done))
                 end
             end
             -- 2) конец фильма / фетчер сдался
