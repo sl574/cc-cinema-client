@@ -34,13 +34,17 @@ local jobid = args[1]
 local fpsArg = tonumber(args[2])
 local fromSec = tonumber(args[3]) or 0
 if fromSec < 0 then fromSec = 0 end
+-- 4-й аргумент: лимит колонок (диагностика топологии/перфа:
+-- дальняя/подвисшая колонка тормозит всех через общий wait).
+-- Например: svideo <job> 20 0 1 (только первая колонка).
+local maxSpk = tonumber(args[4])
 -- fps для расчета окна: файлы уже сняты на своей частоте, meta позже уточнит
 local fps = 20
 if fpsArg then fps = math.max(1, math.min(30, fpsArg)) end
 
 local token = settings.get("svideo.token")
 if not jobid then
-    print("usage: svideo setup <token> | svideo <job_id> [fps] [from_sec]")
+    print("usage: svideo setup <token> | svideo <job_id> [fps] [from_sec] [maxspk]")
     return
 end
 if not token then
@@ -81,6 +85,12 @@ end
 -- ВСЕ динамики: вплотную + по проводной сети (wired modem + кабель).
 -- Дальним колонкам нужен проводной модем у компа и у колонки.
 local speakers = { peripheral.find("speaker") }
+if maxSpk and maxSpk >= 1 and #speakers > maxSpk then
+    print("speakers: " .. #speakers .. " -> using first " .. maxSpk)
+    local cut = {}
+    for i = 1, maxSpk do cut[i] = speakers[i] end
+    speakers = cut
+end
 if #speakers == 0 then print("no speaker - only video")
 else print("speakers: " .. #speakers) end
 
