@@ -396,20 +396,21 @@ end
 -- (2.7с) и слышимый сдвиг гуляет независимо от наших часов.
 -- Возвращает true если отдано.
 local function feedPiece(sp, piece, tp)
+    -- сразу: пустой буфер = есть место, глубина не растет
     if sp.playAudio(piece) then return true end
-    local t = os.startTimer(1)
+    -- буфер полон: ждем ИМЕННО опустошения. Чужие события (таймеры видео
+    -- каждые 50мс!) игнорируем, иначе накормим по первому чиху и буфер
+    -- снова встанет полный на 2.7с. Страховка - свой таймер 2с.
+    local t = os.startTimer(2)
     while true do
-        local ev = os.pullEvent()
+        local ev, p1 = os.pullEvent()
         if ev == "speaker_audio_empty" then
-            os.cancelTimer(t)
+            -- может быть чужой empty (6 колонок): не влезло - ждем дальше
+            if sp.playAudio(piece) then os.cancelTimer(t) return true end
+        elseif ev == "timer" and p1 == t then
+            -- empty потерялся: отдать как есть (редкий случай)
             return sp.playAudio(piece)
-        end
-        if ev == "timer" then
-            -- страховка от потерянного empty: отдать как есть
-            return sp.playAudio(piece)
-        end
-        -- протух пока ждали / пауза: не отдаем (вызыватель посчитает)
-        if tp < vTime - 0.75 or paused then
+        elseif tp < vTime - 0.75 or paused then
             os.cancelTimer(t)
             return false
         end
