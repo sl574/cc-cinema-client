@@ -399,6 +399,30 @@ local function playOn(sp, pcm)
         os.pullEvent()
     end
 end
+-- отдать кусок PCM (~0.17с) в колонку, дождавшись почти пустого буфера
+-- (speaker_audio_empty), а не любого места: иначе буфер стоит полный
+-- (2.7с) и слышимый сдвиг гуляет независимо от наших часов.
+-- Возвращает true если отдано.
+local function feedPiece(sp, piece, tp)
+    if sp.playAudio(piece) then return true end
+    local t = os.startTimer(1)
+    while true do
+        local ev = os.pullEvent()
+        if ev == "speaker_audio_empty" then
+            os.cancelTimer(t)
+            return sp.playAudio(piece)
+        end
+        if ev == "timer" then
+            -- страховка от потерянного empty: отдать как есть
+            return sp.playAudio(piece)
+        end
+        -- протух пока ждали / пауза: не отдаем (вызыватель посчитает)
+        if tp < vTime - 0.75 or paused then
+            os.cancelTimer(t)
+            return false
+        end
+    end
+end
 local function playAudio()
     if #speakers == 0 then return end
     while true do
@@ -417,14 +441,44 @@ local function playAudio()
             else
                 table.remove(aQueue, 1)
                 local pcm = decodeChunk(data)
-                -- один чанк сразу во все колонки, параллельно (как у YouCube)
-                local fns = {}
-                for i, sp in ipairs(speakers) do
-                    fns[i] = function() playOn(sp, pcm) end
+                -- SUB-PIECE: чанк пилим на куски ~0.17с и отдаем строго по
+                -- часам видео. Иначе 2.7с буфер колонки отвязывает слышимое
+                -- от выданного (качели быстрее/медленнее при просадках).
+                local total, step = #pcm, 8192
+                local off = 1
+                while off <= total do
+                    local e = math.min(off + step - 1, total)
+                    local pdur = (e - off + 1) / 48000
+                    local more = e < total or #aQueue > 0 or not fetch_done
+                    if aTime < vTime - 0.75 and more then
+                        aTime = aTime + pdur
+                        droppedA = droppedA + 1
+                    else
+                        while aTime > vTime + 0.5 and ceilWaited < 10000
+                                and not paused and not finished do
+                            sleep(0.1)
+                            ceilWaited = ceilWaited + 100
+                            audioHold = audioHold + 1
+                        end
+                        if paused then
+                            -- пауза посреди чанка: динамики и так стопнуты,
+                            -- остаток пропускаем (дыра <=1.37с, неслышно)
+                            aTime = aTime + (total - off + 1) / 48000
+                            break
+                        end
+                        local tp = aTime
+                        local piece = {}
+                        for k = off, e do piece[#piece + 1] = pcm[k] end
+                        local fns = {}
+                        for i, sp in ipairs(speakers) do
+                            fns[i] = function() feedPiece(sp, piece, tp) end
+                        end
+                        parallel.waitForAll(table.unpack(fns))
+                        aTime = aTime + pdur
+                        ceilWaited = 0
+                    end
+                    off = e + 1
                 end
-                parallel.waitForAll(table.unpack(fns))
-                aTime = aTime + dur
-                ceilWaited = 0
             end
         elseif #aQueue > 0 then
             -- потолок: звук убежал вперед видео (видос встал/скипнулся) -
