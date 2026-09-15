@@ -198,7 +198,7 @@ local paused = false
 local finished = false -- playVideo выставляет в конце, чтобы умер watchPause
 -- часы A/V-синка (секунды показанного/сыгранного от старта показа):
 -- видео убегает вперед скипами, звук догоняет сбросами (см. playAudio)
-local vTime, avWaited, aTime, droppedA, ceilWaited, audioHold = 0, 0, 0, 0, 0, 0
+local vTime, aTime, droppedA, ceilWaited, audioHold = 0, 0, 0, 0, 0
 local lastFrame = nil
 -- статистика потока: K/R/D принято, drop битых, trunc обрезанных батчей,
 -- gap разрывов непрерывности, dup дублей
@@ -658,38 +658,20 @@ local function playVideo()
         if paused then
             sleep(0.05)
             t0 = t0 + 50
-        elseif #vQueue > 0 and not (#speakers > 0 and aTime < vTime - 1.25 and avWaited < 2000) then
+        elseif #vQueue > 0 then
             local now = os.epoch("utc")
             local expected = (now - t0) / 1000 * fps
-            if expected - m > fps * 0.75 and #vQueue > 2 then
-                -- v7.1 цепные дельты: скипаем все D до ближайшего полного кадра,
-                -- полный всегда рисуем (там же ресинк базы). Пропуск D без
-                -- ресинка давал бы шлейф до конца GOP.
-                local skip = math.min(#vQueue - 1, math.floor(expected - m) - 1)
-                while skip > 0 and #vQueue > 1 do
-                    if vQueue[1].full then resyncs = resyncs + 1 break end
-                    table.remove(vQueue, 1) n = n + 1 m = m + 1 dropped = dropped + 1
-                    skip = skip - 1
-                end
-            end
             local fr = table.remove(vQueue, 1)
             drawFrame(fr)
             -- скип мог выкинуть кейфрейм: если дельта пришла без базы, ждем следующий K
             n = n + 1
             m = m + 1
             vTime = m / fps
-            if aTime >= vTime - 0.5 then avWaited = 0 end
             if n >= total_frames and fetch_done then break end
             local target = t0 + m * interval * 1000
             local now2 = os.epoch("utc")
             if target > now2 then sleep((target - now2) / 1000) end
-        elseif #vQueue > 0 then
-            -- av-wait: звук отстал больше секунды (пролаг) - стоим на месте,
-            -- двигаем часы как на паузе. Иначе скип убежит вперед, а звук
-            -- догонять не умеет и отстанет навсегда.
-            sleep(0.1)
-            t0 = t0 + 100
-            avWaited = avWaited + 100
+            if target <= now2 and #vQueue > 0 then late = late + 1 end
         elseif fetch_done then
             break
         else
