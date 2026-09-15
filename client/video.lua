@@ -10,7 +10,7 @@ local server = args[2]
 local fps = tonumber(args[3]) or 15
 local fromSec = tonumber(args[4]) or 0
 if fps < 1 then fps = 1 end
-if fps > 20 then fps = 20 end
+if fps > 30 then fps = 30 end
 if fromSec < 0 then fromSec = 0 end
 
 if not url or not server then
@@ -198,7 +198,7 @@ local paused = false
 local finished = false -- playVideo выставляет в конце, чтобы умер watchPause
 -- часы A/V-синка (секунды показанного/сыгранного от старта показа):
 -- видео убегает вперед скипами, звук догоняет сбросами (см. playAudio)
-local vTime, avWaited, aTime, droppedA = 0, 0, 0, 0
+local vTime, avWaited, aTime, droppedA, ceilWaited, audioHold = 0, 0, 0, 0, 0, 0
 local lastFrame = nil
 -- статистика потока: K/R/D принято, drop битых, trunc обрезанных батчей,
 -- gap разрывов непрерывности, dup дублей
@@ -374,7 +374,7 @@ local function playAudio()
     while true do
         if paused then
             sleep(0.05)
-        elseif #aQueue > 0 then
+        elseif #aQueue > 0 and not (aTime > vTime + 0.5 and ceilWaited < 10000) then
             local data = aQueue[1]
             local dur = (#data * 8) / 48000 -- чанк звука в секундах
             if aTime < vTime - 0.75 and #aQueue > 1 then
@@ -394,7 +394,14 @@ local function playAudio()
             end
             parallel.waitForAll(table.unpack(fns))
                 aTime = aTime + dur
+                ceilWaited = 0
             end
+        elseif #aQueue > 0 then
+            -- потолок: звук убежал вперед видео (видос встал/скипнулся) -
+            -- стоим, колонки доигрывают буфер и молчат. Кеп 10с.
+            sleep(0.1)
+            ceilWaited = ceilWaited + 100
+            audioHold = audioHold + 1
         elseif fetch_done then
             break
         else
@@ -676,4 +683,4 @@ end
 
 restorePalette()
 monitor.setCursorPos(1, mh)
-print("done. dropped(skipped late): " .. dropped .. " resyncs: " .. resyncs .. " blitErr: " .. cntBlitErr .. " audioDrop: " .. droppedA .. " - Ctrl+T for new link")
+print("done. dropped(skipped late): " .. dropped .. " resyncs: " .. resyncs .. " blitErr: " .. cntBlitErr .. " audioDrop: " .. droppedA .. " audioHold: " .. audioHold .. " - Ctrl+T for new link")
