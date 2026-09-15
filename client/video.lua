@@ -391,10 +391,10 @@ local function playAudio()
     while true do
         if paused then
             sleep(0.05)
-        elseif #aQueue > 0 and not (aTime > vTime + 0.5 and ceilWaited < 10000) then
+        elseif #aQueue > 0 and not (aTime > vTime + 0.1) then
             local data = aQueue[1]
             local dur = (#data * 8) / 48000 -- чанк звука в секундах
-            if aTime < vTime - 0.75 and #aQueue > 1 then
+            if aTime < vTime - 0.5 and #aQueue > 1 then
                 -- звук отстал от видео (пролаг): роняем старый кусок без
                 -- проигрывания. Иначе отстанет навсегда: видео скипает,
                 -- а звук скипать не умел.
@@ -413,11 +413,11 @@ local function playAudio()
                     local e = math.min(off + step - 1, total)
                     local pdur = (e - off + 1) / 48000
                     local more = e < total or #aQueue > 0 or not fetch_done
-                    if aTime < vTime - 0.75 and more then
+                    if aTime < vTime - 0.5 and more then
                         aTime = aTime + pdur
                         droppedA = droppedA + 1
                     else
-                        while aTime > vTime + 0.5 and ceilWaited < 10000
+                        while aTime > vTime + 0.1
                                 and not paused and not finished do
                             sleep(0.1)
                             ceilWaited = ceilWaited + 100
