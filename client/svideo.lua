@@ -285,7 +285,7 @@ local paused = false
 local finished = false -- playVideo выставляет в конце, чтобы умер watchPause
 -- часы A/V-синка (секунды показанного/сыгранного от старта показа):
 -- видео убегает вперед скипами, звук догоняет сбросами (см. playAudio)
-local vTime, avWaited, aTime, droppedA, ceilWaited, audioHold = 0, 0, 0, 0, 0, 0
+local vTime, aTime, droppedA, ceilWaited, audioHold = 0, 0, 0, 0, 0
 -- статистика: dropped - кадры, примененные к базе без показа (отставание),
 -- late - пробуждений с отставанием >1 кадра, stalls - тиков без данных
 -- (сеть/CDN), badRec - битые записи
@@ -761,11 +761,13 @@ local function dbgTag(n)
 end
 
 -- Кадр в тик. Цикл: [пробуждение таймера = начало тика] -> серия блитов
--- подготовленного кадра -> применить к базе следующий(е) кадр(ы) ->
--- посчитать изменившиеся строки -> спать до момента показа. Отставание
--- гасится применением нескольких кадров к базе за тик (показан только
--- последний), если среди них есть K/R - все до него просто выбрасываем.
-local MAX_APPLY = 8 -- кадров к базе за тик максимум (иначе сами же опоздаем)
+-- подготовленного кадра -> применить к базе СЛЕДУЮЩИЙ кадр ->
+-- посчитать изменившиеся строки -> спать до момента показа.
+-- СТРОГО ОДИН кадр за тик, всегда по порядку, БЕЗ скипов/догонов/фризов:
+-- отставание от стены НЕ гасится прыжками - фильм просто идет медленнее
+-- стены, зато картинка и звук всегда вместе (vinyl slowdown, не judder).
+-- Звук привязан потолком/сбросами к показанным кадрам, глубины рассинхрона
+-- взяться неоткуда: нечего догонять - нечего рвать.
 local function playVideo()
     local interval = 1000 / fps
     local n = startFrame   -- следующий кадр из очереди (номер в фильме)
@@ -799,57 +801,33 @@ local function playVideo()
             -- 2) конец фильма / фетчер сдался
             if n >= total_frames or (#vQueue == 0 and fetch_done) then break end
             local now = os.epoch("utc")
-            local avHold = total_dchunks > 0 and aTime < vTime - 1.25 and avWaited < 2000
-            if #vQueue == 0 or avHold then
-                -- 3a) нет данных (сеть) или звук отстал >1с (пролаг): стоим.
-                -- Часы держим, если звука нет (нечего догонять - покажем все
-                -- кадры) или ждем звук. Со звуком часы идут: звук буферизован
-                -- глубже видео и играет дальше, видео потом догонит скипом.
-                if #vQueue == 0 then stalls = stalls + 1 end
+            if #vQueue == 0 then
+                -- 3a) нет данных (сеть): стоим. Часы стоят только если звука
+                -- нет (нечего догонять - покажем все кадры); со звуком часы
+                -- идут, но догонять НЕ будем - продолжим по порядку, фильм
+                -- просто закончится позже стены.
+                stalls = stalls + 1
                 sleep(0.05)
                 local dt = os.epoch("utc") - now
-                if avHold then
-                    t0 = t0 + dt
-                    avWaited = avWaited + dt
-                elseif total_dchunks == 0 then
+                if total_dchunks == 0 then
                     t0 = t0 + dt
                 end
             else
-                -- 3b) сколько кадров должно быть показано к СЛЕДУЮЩЕМУ тику
-                local want = floor((now + 50 - t0) / interval) + 1
-                if want < m + 1 then want = m + 1 end
-                local deficit = math.min(want - m, #vQueue)
-                if deficit > 1 then
-                    late = late + 1
-                    -- отстаем: все до ПОСЛЕДНЕГО полного кадра в пределах
-                    -- отставания выбрасываем не применяя (K/R сбросят базу)
-                    local lastFull = nil
-                    for i = 1, deficit do
-                        if sbyte(vQueue[i], 1) ~= 68 then lastFull = i end
-                    end
-                    if lastFull and lastFull > 1 then
-                        for _ = 1, lastFull - 1 do
-                            table.remove(vQueue, 1)
-                            n, m, dropped = n + 1, m + 1, dropped + 1
-                        end
-                        deficit = deficit - (lastFull - 1)
-                    end
-                end
-                -- остальные применяем к базе цепочкой (не больше MAX_APPLY
-                -- за тик); показан будет только последний
-                local budget = math.min(deficit, MAX_APPLY)
-                for i = 1, budget do
-                    applyRecord(table.remove(vQueue, 1))
-                    n, m = n + 1, m + 1
-                    if i < budget then dropped = dropped + 1 end
-                end
+                -- 3b) строго ОДИН следующий кадр за тик: применить к базе,
+                -- посчитать строки, показать следующим тиком. Никаких скипов,
+                -- догонов и фризов: отставание от стены не гасится прыжками,
+                -- фильм идет медленнее стены, зато картинка и звук вместе.
+                applyRecord(table.remove(vQueue, 1))
+                n, m = n + 1, m + 1
                 vTime = m / fps
-                if aTime >= vTime - 0.5 then avWaited = 0 end
                 pendingRows = diffRows()
                 -- 4) спим до момента показа кадра (m-1), минимум до след. тика
                 local target = t0 + (m - 1) * interval
                 local wait = target - os.epoch("utc")
-                if wait < 25 then wait = 25 end
+                if wait < 25 then
+                    wait = 25
+                    late = late + 1 -- дедлайн сорван: тик опоздал (нагрузка)
+                end
                 sleep(wait / 1000)
             end
         end
