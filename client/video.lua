@@ -716,6 +716,10 @@ if duration > 0 then
     print(string.format("length: %d:%02d", math.floor(duration / 60), math.floor(duration % 60)))
 end
 print("pause: tap monitor / space")
+-- GC в инкрементальном режиме: короткие частые шаги вместо редких
+-- стоп-пауз на много-МБ куче (очередь + таблицы дельт). Иначе GC-стоп
+-- выглядит как late-tick + просадка accepts.
+pcall(collectgarbage, "setpause", 110)
 
 -- враппер потоков: любая ошибка печатается СРАЗУ с именем потока
 -- (раньше тихая смерть видеопотока выглядела как "стоп-кадр + звук идет"),
